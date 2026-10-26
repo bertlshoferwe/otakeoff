@@ -15,6 +15,7 @@ Click **Pin** beside **Sheets** in the top toolbar, then click two corners aroun
 
 ## Unreleased
 
+- **A broken image in a ZIP no longer hides the remaining plans.** Each extracted file is processed independently, so unreadable PNG/JPEG entries are skipped by their own names while later PDFs and valid scans still open. Archive limits and downstream PDF validation are unchanged.
 - **MCP 0.9.100: dependency security refresh.** Upgrade the MCP SDK and Zod, adapt record schemas for Zod 4, and refresh affected MCP, Vite and protocol dependency locks. The MCP tool set and takeoff payloads are unchanged. [Validation evidence](docs/review/dependency-security-2026-10-24/README.md).
 
 - **MCP 0.9.99: estimate verbs.** `set_pricing`, `set_estimate_settings`, `estimate_summary`, `export_estimate` and `export_proposal` give an agent the Estimate panel and the Proposal dialog over the same engine. Prices are the estimator's; nothing proposes or defaults one, and every unentered price is reported. Prices, markups, proposal text and client ride `export_takeoff` / `import_takeoff`. The draft document schema gains `estimate_settings` and `bid_proposal`. The server now depends on `fflate` for the workbook.
