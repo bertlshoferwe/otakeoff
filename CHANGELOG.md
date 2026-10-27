@@ -15,6 +15,9 @@ Click **Pin** beside **Sheets** in the top toolbar, then click two corners aroun
 
 ## Unreleased
 
+- **Check a dimension reads a hyphen length that ends with an inch mark.** `12-6"` is 12 ft 6 in, the same length as `12-6`. `12-14"` is still not a dimension, and a bare `6"` is unchanged.
+- **A capture's age stays in the bucket the clock chose.** At 59.5 minutes the Captures row reads "59m ago", at 23.5 hours "23h ago", and at 6.5 days "6d ago". "1h ago" still starts at 60 minutes, "yesterday" at 24 hours, and the plain date at 7 days.
+
 - **A broken image in a ZIP no longer hides the remaining plans.** Each extracted file is processed independently, so unreadable PNG/JPEG entries are skipped by their own names while later PDFs and valid scans still open. Archive limits and downstream PDF validation are unchanged.
 - **MCP 0.9.100: dependency security refresh.** Upgrade the MCP SDK and Zod, adapt record schemas for Zod 4, and refresh affected MCP, Vite and protocol dependency locks. The MCP tool set and takeoff payloads are unchanged. [Validation evidence](docs/review/dependency-security-2026-10-24/README.md).
 
@@ -224,6 +227,11 @@ writers still use the current canvas format.
 
 All notable changes to OpenTakeoff. Dates are release/merge dates on `main`.
 
+## 2026-10-26 — split-screen reference pane
+
+### Added
+- **Split screen (reference pane).** Drag a sheet tab to a screen edge (left, right, top, bottom) and the canvas splits: the dragged sheet opens in a second pane that frames one sheet at its own pan and zoom, crisp detail tiles included, and mirrors the primary sheet's committed shapes and markups read-only. The primary pane keeps every measuring tool, snap grid, and shortcut; only the display transform is duplicated, never the coordinate, measurement, keyboard, or undo machinery. The divider drags to resize, **⟳** flips the split orientation, **✕** closes the pane with fold-back, and the layout persists in the project save. The drop gesture offers five zones—edges split, center adds the tab to a side-by-side group as before. Panes together keep at most 6 sheets live; the feature disables itself below a narrow viewport or on a low-memory device. Known limit, tracked in the fork's issue #214: a reference pane cannot frame a stitch yet.
+
 ## Unreleased — Equipment schedules of any trade, and counting by label (mcp 0.9.77)
 
 ### Added
@@ -331,7 +339,6 @@ All notable changes to OpenTakeoff. Dates are release/merge dates on `main`.
 ### Added
 - **`extra` disclosure on symbol_sweep placements.** A placement that reproduces the whole seed but carries more than 30% unmatched extra linework fully inside its footprint (a register against a grille seed — the same outline plus louvers) now carries its measured `extra` fraction on the row, in both scopes. By default it still counts — the #259 contained-seed workflow depends on supersets matching — but the classic mislabel is named instead of hiding in the count. Background lines crossing the symbol and coincident duplicate ink never trip it.
 - **`variant_guard: true` on symbol_sweep** — whole-symbol mode: extra-ink placements demote to `withheld` as questions instead of counting. Stands down automatically when `exclude` counter-examples are in play (negatives are manual variant discrimination). `sweep_schedule_row` keeps disclosure only — tag corroboration already discriminates variants there. (mcp 0.9.66)
-
 ## 2026-08-26 — the readout keeps a tape log
 
 ### Added
