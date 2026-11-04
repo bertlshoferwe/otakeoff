@@ -125,7 +125,7 @@ export async function buildBidProposalPdf(model) {
     text(s.tag, col.item, 10, bold);
     textRight(qty(s.qty), col.qty, 10);
     text(s.unit, col.unit, 10, font, muted);
-    if (model.itemized) textRight(money(s.price), col.price, 10);
+    if (model.itemized) textRight(s.included ? "Included" : money(s.price), col.price, 10, font, s.included ? muted : undefined);
     lines.forEach((l, i) => { if (i) y -= 12; text(l, col.desc, 9.5); });
     y -= 16;
   }
@@ -176,6 +176,8 @@ export async function buildBidProposalPdf(model) {
   sigRow("Date");
 
   // ── every page: page n of N + the OpenTakeoff watermark ──────────────────
+  // Unconditional: no model field, branding mode or company setting reaches
+  // this loop, so a proposal can't be written without the watermark.
   const pages = doc.getPages();
   pages.forEach((pg, i) => {
     if (pages.length > 1) pg.drawText(`Page ${i + 1} of ${pages.length}`, { x: M, y: 18, size: 7.5, font, color: muted });
