@@ -18,6 +18,7 @@ import ReferencePins, { PinButton } from "../components/ReferencePins.jsx";
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { keyText } from "../lib/keys.ts";
 import { nextHatchId } from "../lib/takeoffConstants.ts";
+import { TRADE_SUITES, ALL_TRADES, tradeHiddenIds, tradeCounts, sanitizeViewTrade, suiteById, conditionTrade } from "../lib/tradeSuites.ts";
 import { buildTakeoffDocument, sheetEntry } from "../lib/takeoffDocument.js";
 import { flushSync } from "react-dom";
 import { Link, useNavigate } from "react-router";
@@ -42,10 +43,12 @@ import { buildProfile, parseProfile, applyProfile, resetProfileDefaults, isProfi
 import ToolMenu from "../components/ToolMenu.jsx";
 import PlanNavigator from "../components/PlanNavigator.jsx";
 import FirstTakeoffTour from "../components/FirstTakeoffTour.jsx";
+import ToolTray from "../components/ToolTray.jsx";
+import AssistantWindow from "../components/AssistantWindow.jsx";
 import ConnectAI from "../components/ConnectAI.jsx";
 import CompanySetup from "../components/CompanySetup.jsx";
 import EstimatePanel from "../components/EstimatePanel.jsx";
-import { sanitizeEstimateSettings } from "../lib/estimate.js";
+import { sanitizeEstimateSettings, priceEstimate } from "../lib/estimate.js";
 import { sanitizeBidProposal } from "../lib/bidProposal.js";
 import { loadEstimatingDefaults } from "../lib/companySetup.js";
 import { advanceTour, countFloorShapes, currentStep } from "../lib/firstTakeoff.js";
@@ -181,7 +184,9 @@ import { ScanStar, OtLockup } from "../brand/marks.jsx";
 import WorkspacePanel from "../components/WorkspacePanel.jsx";
 import { openPremiumPricing } from "../lib/premiumPlans.js";
 import "../styles/premiumWorkspace.css";
-import { WorkspaceChrome, WorkspaceNavigator, WorkspaceCommandMenu } from "../components/WorkspaceChrome.jsx";
+import { WorkspaceNavigator, WorkspaceCommandMenu } from "../components/WorkspaceChrome.jsx";
+import { PremiumRail, PremiumTopBar, CanvasSideTabs } from "../components/PremiumChrome.jsx";
+import ConditionsDock from "../components/ConditionsDock.jsx";
 import { useWorkspaceLayout, WorkspaceLayoutDialog, DockHandle, DockTargets } from "../components/WorkspaceLayout.jsx";
 import AiSettings from "../components/AiSettings.jsx";
 import { agentToolDefs, executeAgentTool, agentScaleGate } from "../lib/agentTools.js";
@@ -446,6 +451,23 @@ export default function TakeoffCanvas() {
   const [leftTab, setLeftTab] = useState(null);
   const [showMarkups, setShowMarkups] = useState(true);       // markup SVG layer visibility (orthogonal to the export checkbox)
   const [hiddenConds, setHiddenConds] = useState(() => new Set()); // condition ids whose takeoffs are hidden on the canvas (#440) — VIEW STATE: never persisted, never touches totals/report/exports
+  // the status bar's Trade view (lib/tradeSuites.ts): shows one trade's conditions and shapes, and books new
+  // conditions to it. Per-user VIEW STATE in localStorage — never a quantity, never in the project file.
+  const [viewTrade, setViewTrade] = useState(() => { try { return sanitizeViewTrade(localStorage.getItem("opentakeoff_view_trade")); } catch { return ALL_TRADES; } });
+  useEffect(() => { try { localStorage.setItem("opentakeoff_view_trade", viewTrade); } catch { /* private mode */ } }, [viewTrade]);
+  // switching trades moves the active condition to that trade's first one, when it has any
+  const pickViewTrade = (raw) => {
+    const v = sanitizeViewTrade(raw);
+    setViewTrade(v);
+    if (v === ALL_TRADES) return;
+    const cs = agentStateRef.current.conditions.length ? agentStateRef.current.conditions : conditions;
+    const cur = cs.find((c) => c.id === activeCond);
+    if (cur && conditionTrade(cur) === v) return;
+    const first = cs.find((c) => conditionTrade(c) === v);
+    if (first) activateCondition(first.id, { reassign: false });
+  };
+  const viewTradeRef = useRef(viewTrade);   // mintCondition reads the live value (the agent can mint mid-run on a stale closure)
+  viewTradeRef.current = viewTrade;
   const [editor, setEditor] = useState(null);                 // inline on-canvas text editor { left, top, value, multiline, commit } (retires window.prompt; screen-space overlay, NOT an SVG child)
   const [panelEditId, setPanelEditId] = useState(null);       // markup id whose text is being edited inline in the markup panel (off-screen fallback for the ✎ button)
   const [captureQuery, setCaptureQuery] = useState("");       // always-on name filter over the GLOBAL Captures list (transient, mirrors condQuery)
@@ -610,6 +632,17 @@ export default function TakeoffCanvas() {
   }, [panelPrefs]);
   const panelW = clampPanelW(Number(panelPrefs.w) || PANEL_DEFAULTS.w);
   const takeoffsOpen = !panelPrefs.collapsed;
+  // Premium layout: the Conditions dock on the right (list + settings card). Open
+  // by default, remembered in this browser; the classic table stays one ⋯ away.
+  const [condDockOpen, setCondDockOpenRaw] = useState(() => { try { return localStorage.getItem("opentakeoff_conditions_dock") !== "0"; } catch { return true; } });
+  const setCondDockOpen = useCallback((v) => setCondDockOpenRaw((cur) => {
+    const next = typeof v === "function" ? v(cur) : v;
+    try { localStorage.setItem("opentakeoff_conditions_dock", next ? "1" : "0"); } catch { /* session only */ }
+    return next;
+  }), []);
+  // the classic Takeoffs table (library, materials, columns) in the Premium layout:
+  // session-only, so a table left open in the classic layout never covers the dock
+  const [fullTableOpen, setFullTableOpen] = useState(false);
   const toggleTakeoffs = () => setPanelPrefs((p) => ({ ...p, collapsed: !p.collapsed }));
   // Panel resize lives INSIDE TakeoffsPanel (mid-drag width goes straight to
   // its DOM node; the pref commits ONCE on release via setPanelPrefs). Each
@@ -715,6 +748,9 @@ export default function TakeoffCanvas() {
   const [tour, setTour] = useState(null);
   const [tourSampleBusy, setTourSampleBusy] = useState(false);
   const [connectOpen, setConnectOpen] = useState(false);   // Connect your AI (components/ConnectAI.jsx)
+  // the Assistant window (components/AssistantWindow.jsx): the person's own AI app, talking here
+  const [assistantOpen, setAssistantOpen] = useState(false);
+  const openAssistant = useCallback(() => setAssistantOpen(true), []);
   const [companySetupOpen, setCompanySetupOpen] = useState(false);   // Company setup (components/CompanySetup.jsx)
   const [companyRev, setCompanyRev] = useState(0);   // bumped on every Company setup save so an open report's masthead re-reads
   const [proposal, setProposal] = useState(null);  // One-Click selection under review: { key, regions: [{kind:'pos'|'neg', seed, poly, area_sf, perim_lf}] } — panel-LOCAL px
@@ -757,6 +793,17 @@ export default function TakeoffCanvas() {
   const workspaceArrangement = workspacePrefs.layout;
   // the tool dock floating at the canvas foot (Premium's position; default since 2026-11)
   const dockBottom = workspaceLayout && workspaceArrangement.tools === "bottom";
+  // the dock's ⋯ tray — every tool that isn't on the dock itself, laid out at once (Premium's layout)
+  const [trayOpen, setTrayOpen] = useState(false);
+  const dockWrapRef = useRef(null);
+  useEffect(() => {
+    if (!trayOpen) return undefined;
+    const onDown = (e) => { if (dockWrapRef.current && !dockWrapRef.current.contains(e.target)) setTrayOpen(false); };
+    const onKey = (e) => { if (e.key === "Escape") setTrayOpen(false); };
+    document.addEventListener("pointerdown", onDown, true);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("pointerdown", onDown, true); document.removeEventListener("keydown", onKey); };
+  }, [trayOpen]);
   const [workspaceNavigationOpen, setWorkspaceNavigationOpen] = useState(false);
   const [workspaceControlsOpen, setWorkspaceControlsOpen] = useState(false);
   const [workspaceDetailsOpen, setWorkspaceDetailsOpen] = useState(false);
@@ -1641,10 +1688,15 @@ export default function TakeoffCanvas() {
   // what the renderer paints and what the pickers scan, so a hidden shape
   // can't be seen or clicked — while visibleShapes (totals, tally, transition
   // sources) still carries it. Hiding changes the view, never a number.
+  // the Trade view hides other trades the same way, on top of the eye toggles (which it never rewrites)
+  // the active condition always shows: what you are drawing under never goes invisible
+  const tradeHidden = useMemo(() => { const h = tradeHiddenIds(conditions, viewTrade); h.delete(activeCond); return h; }, [conditions, viewTrade, activeCond]);
+  const tradeCountMap = useMemo(() => tradeCounts(conditions), [conditions]);
+  const viewHidden = useMemo(() => (tradeHidden.size ? new Set([...hiddenConds, ...tradeHidden]) : hiddenConds), [hiddenConds, tradeHidden]);
   const stackedShapes = useMemo(() => {
-    const drawn = hiddenConds.size ? visibleShapes.filter((s) => !hiddenConds.has(s.condition_id)) : visibleShapes;
+    const drawn = viewHidden.size ? visibleShapes.filter((s) => !viewHidden.has(s.condition_id)) : visibleShapes;
     return [...drawn].sort((a, b) => tierOf(a) - tierOf(b));
-  }, [visibleShapes, hiddenConds]);
+  }, [visibleShapes, viewHidden]);
   // Reference-pane shapes (split screen, Task 5): deliberately NOT filtered
   // through `visibleShapes` — the reference pane can frame a sheet the
   // primary's sheetGroup doesn't include at all (the tab-drop gesture from
@@ -1656,8 +1708,8 @@ export default function TakeoffCanvas() {
   // drop out here too (#440 parity): a condition hidden on the primary never
   // reappears in the mirror.
   const refStackedShapes = useMemo(
-    () => (effectiveRefKey ? shapes.filter((s) => s.sheet_id === effectiveRefKey && !hiddenConds.has(s.condition_id)).sort((a, b) => tierOf(a) - tierOf(b)) : []),
-    [shapes, effectiveRefKey, hiddenConds]
+    () => (effectiveRefKey ? shapes.filter((s) => s.sheet_id === effectiveRefKey && !viewHidden.has(s.condition_id)).sort((a, b) => tierOf(a) - tierOf(b)) : []),
+    [shapes, effectiveRefKey, viewHidden]
   );
   const visibleMarkups = useMemo(() => {
     const keys = new Set(sheetGroup.length ? sheetGroup : [sheetKey]);
@@ -6782,6 +6834,34 @@ export default function TakeoffCanvas() {
   // markup on the source sheet to resolve (only a synthetic {sheet_id, rect}),
   // so centerOnMarkup/flyToMarkup can't express this — this is why traceSource
   // doesn't reuse them.
+  // Symbol sweep review: bring the selected question into view. q.at is in the
+  // sheet's own pixels (the overlay draws it at q.at[0] + xOffset), and the
+  // sweep panel floats over the canvas's right side, so center within the part
+  // of the canvas left of the panel — otherwise the ring lands under the panel.
+  function centerOnSweepQuestion(sw, i) {
+    const q = sw?.questions?.[i];
+    const sp = q && panelByKey(sw.key);
+    const el = containerRef.current;
+    if (!q || !sp?.img?.w || !el) return false;
+    const r = el.getBoundingClientRect();
+    const panelLeft = window.innerWidth - FLOAT_GAP - SWEEP_PANEL_W;
+    const visibleW = Math.max(120, Math.min(r.right, panelLeft) - r.left);
+    const scale = tfRef.current.scale;
+    const sx = q.at[0] + sp.xOffset, sy = q.at[1];
+    setTfNow({ x: visibleW / 2 - sx * scale, y: r.height / 2 - sy * scale, scale });
+    return true;
+  }
+  // Follow the review cursor: ↵ / X advance it and → / ← step it, so whenever
+  // qIndex moves the view goes with it. Not on the sweep's first render — the
+  // person is still looking at the seed they just marqueed.
+  const sweepFocusRef = useRef(null);
+  useEffect(() => {
+    if (!sweep) { sweepFocusRef.current = null; return; }
+    const id = `${sweep.key}#${sweep.qIndex}`;
+    const prev = sweepFocusRef.current;
+    sweepFocusRef.current = id;
+    if (prev && prev !== id && prev.startsWith(`${sweep.key}#`)) centerOnSweepQuestion(sweep, sweep.qIndex);
+  }, [sweep?.key, sweep?.qIndex]); // eslint-disable-line react-hooks/exhaustive-deps
   function centerOnPanelPoint(sp, nx, ny) {
     if (!sp?.img?.w) return false;
     const el = containerRef.current;
@@ -7021,6 +7101,9 @@ export default function TakeoffCanvas() {
       multiplier: 1,        // ×N for identical repeated units (measure one, multiply)
       waste_pct: 0,         // flooring waste allowance (manual) — applied in the Report
       materials: [],        // supporting materials (adhesive, grout, …) with coverage rates
+      // booked to the trade the canvas is showing, so it stays visible; "All trades" books nothing
+      // (the tag prefix, else Finishes, decides — lib/tradeSuites.ts conditionTrade)
+      ...(viewTradeRef.current !== ALL_TRADES ? { trade: viewTradeRef.current } : {}),
     };
     agentStateRef.current = { ...agentStateRef.current, conditions: [...cs, c] };
     setConditions((prev) => [...prev, c]);
@@ -8505,6 +8588,12 @@ export default function TakeoffCanvas() {
   // exist only in the Report/exports). Same conditionTotals rules, no filter.
   const projRows = useMemo(() => conditionTotals(conditions, shapes, seamCtx), [conditions, shapes, seamCtx]);
   const projRowById = useMemo(() => new Map(projRows.map((r) => [r.id, r])), [projRows]);
+  // the Premium top bar's running $ — the same engine as the Estimate panel, on
+  // the project's markups (or the Company setup defaults until the estimate opens)
+  const estTotal = useMemo(() => {
+    if (!workspaceLayout) return 0;
+    try { return priceEstimate({ rows: projRows, conditions, settings: estimateSettings || loadEstimatingDefaults() }).total; } catch { return 0; }
+  }, [workspaceLayout, projRows, conditions, estimateSettings]);
   // {{qty}} in a note (#474) — the linked condition's measured quantity,
   // whole project, in the display unit system. Resolved at draw time only.
   const noteQtyLabels = useMemo(() => qtyLabels(projRows, units), [projRows, units]);
@@ -8767,7 +8856,8 @@ export default function TakeoffCanvas() {
     return next;
   });
   const openConditionInPanel = (id) => {
-    setPanelPrefs((p) => (p.collapsed ? { ...p, collapsed: false } : p));   // reveal the docked panel; no-op if already open
+    if (workspaceLayout && !fullTableOpen) setCondDockOpen(true);   // Premium layout: the Conditions dock is the panel
+    else setPanelPrefs((p) => (p.collapsed ? { ...p, collapsed: false } : p));   // reveal the docked panel; no-op if already open
     activateCondition(id);   // highlight the row (reassigns a selected shape iff Select is armed, like every activation surface)
     // scroll the docked row into view AFTER the uncollapse paints — two rAFs so
     // the panel has mounted its list (the row carries data-cond-id)
@@ -8935,7 +9025,7 @@ export default function TakeoffCanvas() {
     onUpdateLibMaterial: updateLibMaterial, onPushLibUpdate: pushLibUpdate,
     onDeleteLibMaterial: deleteLibMaterial, onAddLibMaterial: addLibMaterial,
     matFieldOverridden,   // pure helper, not an event handler — the forwarder returns its result
-    onToggleCollapse: toggleTakeoffs, onTogglePin: togglePin, onToggleHidden: toggleCondHidden,
+    onToggleCollapse: () => (workspaceLayout ? setFullTableOpen((v) => !v) : toggleTakeoffs()), onTogglePin: togglePin, onToggleHidden: toggleCondHidden,
     // these three are ALREADY stable on their own (setState identity, and
     // holdPanelGesture is a useCallback with an empty dep array) — routed
     // through the registry anyway so the memo contract has exactly ONE
@@ -10338,13 +10428,17 @@ export default function TakeoffCanvas() {
           {panelBtn(() => setShowRevisions(true), "revisions", "Revisions — save the takeoff at each bid revision, compare what moved", showRevisions)}
         </div>
 
+        {workspaceLayout && !focusMode && view === "canvas" && !showReport && <CanvasSideTabs
+          conditionsOpen={condDockOpen && !fullTableOpen} conditionCount={conditions.length}
+          onConditions={() => { if (fullTableOpen) { setFullTableOpen(false); setCondDockOpen(true); } else setCondDockOpen((v) => !v); }}
+          assistantOpen={assistantOpen} onAssistant={() => (assistantOpen ? setAssistantOpen(false) : openAssistant())} working={agentRunning} />}
         <DropZoneOverlay zone={dragZone} />
        </div>
   );
   return (
     // .app-shell: the print stylesheet collapses this 100vh flex column while the report is open
     <div
-      className={`app-shell${workspaceLayout ? " workspace-calm premium-workspace" : ""}`}
+      className={`app-shell${workspaceLayout ? " workspace-calm premium-workspace" : ""}${workspaceLayout && !focusMode ? " pc-on" : ""}`}
       data-workspace-look={workspaceLayout ? workspaceArrangement.look : undefined}
       onDragOver={(e) => e.preventDefault()}
       onDrop={(e) => { e.preventDefault(); handleFiles(e.dataTransfer?.files); }}
@@ -10373,38 +10467,64 @@ export default function TakeoffCanvas() {
           as "Export is unclickable". The row therefore SCROLLS itself; its
           menus open position:fixed off the trigger rect (ToolMenu) so this
           overflow cannot clip them. */}
-      {!focusMode && workspaceLayout && <WorkspaceChrome
-        title={projectName || active} onOpen={() => fileInputRef.current?.click()}
-        onNavigate={() => setWorkspaceNavigationOpen((v) => !v)} navigationOpen={workspaceNavigationOpen}
-        onTakeoffs={toggleTakeoffs} takeoffsOpen={takeoffsOpen} onWork={() => setAgentOpen((v) => !v)} workOpen={agentOpen} workButtonRef={workButtonRef}
-        pending={shapes.filter((shape) => shape.origin?.reviewed === false).length} running={agentRunning}
-        onPremium={openPremiumPricing} onReport={() => setShowReport(true)} onEstimate={openEstimate} onFocus={toggleFocusMode} onClassic={() => workspacePrefs.setEnabled(false)}
-        onControls={() => setWorkspaceControlsOpen((v) => !v)} controlsOpen={workspaceControlsOpen} onSearch={() => setWorkspaceSearchOpen(true)}
-        pinControl={pinButton}
-        panelTools={<div className="calm-panel-tools" role="group" aria-label="Quantity and review tools">
-          {panelBtn(() => setLeftTab((t) => (t === "markup" ? null : "markup")), "document", "Markup list — existing clouds, callouts, and notes", leftTab === "markup", markupCount)}
-          {panelBtn(() => setLeftTab((t) => (t === "stamp" ? null : "stamp")), "stamp", "Stamps — reusable annotations dropped click-to-place", leftTab === "stamp", stampLib.stamps.length)}
-          {panelBtn(() => setLeftTab((t) => (t === "rfi" ? null : "rfi")), "rfi", "RFI register — raise, track, and export Requests For Information", leftTab === "rfi", rfis.length)}
-          {rollByCond.size > 0 && panelBtn(() => setRollPanelOpen((o) => !o), "roll", "Roll goods — the cut diagram, cutting order, and figured order footage", rollPanelOpen, rollByCond.size)}
-          {layerEntries.length > 0 && panelBtn(() => setLayersOpen((o) => !o), "layers", "PDF layers — drawing layers", layersOpen, layerEntries.reduce((n, e) => n + e.layers.length, 0))}
-          {panelBtn(() => setShowRevisions(true), "revisions", "Revisions — save the takeoff at each bid revision, compare what moved", showRevisions)}
-        </div>}
-        layoutMenu={<button type="button" onClick={() => setWorkspaceLayoutOpen(true)} title="Arrange panels, lock positions, and save layouts"><Icon name="sliders" size={16} />Layout</button>}
-        helpMenu={<ToolMenu title="Learn OpenTakeoff, or connect an AI agent" face={<span>Help</span>} onOpenChange={onMenuDepth} items={[
+      {!focusMode && workspaceLayout && <PremiumRail running={agentRunning} onMenuDepth={onMenuDepth}
+        onSearch={() => setWorkspaceSearchOpen(true)}
+        onSheets={() => setWorkspaceNavigationOpen((v) => !v)} sheetsOpen={workspaceNavigationOpen}
+        onOpenPlans={() => fileInputRef.current?.click()}
+        onCollapse={toggleFocusMode} onLayout={() => setWorkspaceLayoutOpen(true)}
+        helpItems={[
           { id: "tour", label: "Guided first takeoff", onSelect: startTour },
           { id: "guide", label: "How OpenTakeoff works", shortcut: "?", onSelect: () => setGuideOpen(true) },
+          { id: "assistant", label: "Assistant — talk to your own AI here", onSelect: openAssistant },
           { id: "connect-ai", label: "Connect your AI", onSelect: () => setConnectOpen(true) },
         ]} />}
-        fileMenu={<><ToolMenu title="Files and workspace" face={<span>File</span>} onOpenChange={onMenuDepth} items={sheetMenuItems} /><PresenceChip bridge={store.syncBridge} /><AccountChip note={cloudMode ? "Synced to Google Drive" : "Local workspace"} onOpenChange={onMenuDepth} /></>}
-        conditionControl={<><label className="calm-condition-label" htmlFor="workspace-condition">Condition</label><select id="workspace-condition" value={activeCond || ""} onChange={(e) => activateCondition(e.target.value)} title={tool === "select" && selectedId ? "Reassign selected measurement" : "Condition for the next measurement"}>
-          {!conditions.length && <option value="">No conditions</option>}{conditions.map((c) => <option key={c.id} value={c.id}>{c.finish_tag}</option>)}</select>
-          <button type="button" onClick={addCondition} title="Add condition" aria-label="Add condition"><Icon name="plus" size={14} /></button>
-          <button type="button" onClick={() => setWorkspaceDetailsOpen((v) => !v)} aria-expanded={workspaceDetailsOpen} disabled={!aCond}>Properties</button></>}
-        history={<><button type="button" onClick={() => poly.length ? dropLastPoint() : undoShapeCommand()} title="Undo (⌘Z)" aria-label="Undo"><Icon name="undo" size={16} /></button><button type="button" onClick={redoShapeCommand} title="Redo (⇧⌘Z)" aria-label="Redo"><span style={{ display: "flex", transform: "scaleX(-1)" }}><Icon name="undo" size={16} /></span></button></>}
-        aids={<><button type="button" aria-pressed={tool === "zone"} onClick={() => setTool((t) => (t === "zone" ? "select" : "zone"))} title="Zone check — trace a region (an apartment, a wing) to read every condition's quantities inside it, materials included. Nothing is saved; the outline clears when you leave the tool."><Icon name="zone" size={15} />Zone</button><button type="button" aria-pressed={snapOn} onClick={() => setSnapOn((v) => !v)} title="Snap to plan lines/corners (beta)"><Icon name="snap" size={15} />Snap</button><button type="button" aria-pressed={angleOn} onClick={() => setAngleOn((v) => !v)} title="45°/90° angle guides"><Icon name="angle" size={15} />45°</button>{draftMenu}<span className="calm-separator" />{annotations.control}</>}
-        action={finishOk && <button type="button" onClick={finishShape}>Finish ({poly.length})</button>}
-        scaleMenu={<><button type="button" onClick={() => setUnits((u) => u === "metric" ? "imperial" : "metric")} title="Switch display units">{units === "metric" ? "m" : "ft"}</button><ToolMenu title={scaleTitle} onOpenChange={onScaleMenuDepth} face={<span data-tour="scale">{scaleFace}</span>} faceStyle={{ fontFamily: "var(--f-mono)", fontSize: 11.5, ...scaleFaceStyle }} menuStyle={{ minWidth: 250 }} items={scaleItems} /></>}
-      />}
+      {!focusMode && workspaceLayout && (() => {
+        const kept = shapes.filter((sh) => sh.origin?.reviewed !== false).length;
+        const pendingN = shapes.filter((sh) => sh.origin?.reviewed === false).length;
+        const moreItems = [
+          { section: "Plans" },
+          { id: "open-plans", icon: "plus", label: "Open plans…", onSelect: () => fileInputRef.current?.click() },
+          // the sheet switcher already lists pages and files; keep the set operations and file moves
+          ...sheetMenuItems.filter((it) => it !== "divider" && !/^(pg|f)-/.test(it.id || "") && (!it.section || it.section.startsWith("Profile"))),
+          "divider",
+          { section: "Panels" },
+          { id: "work", icon: "target", label: "Work and review", checked: agentOpen, onSelect: () => setAgentOpen((v) => !v) },
+          { id: "full-takeoffs", icon: "takeoffs", label: "Takeoffs table — library, materials, columns", checked: fullTableOpen, onSelect: () => setFullTableOpen((v) => !v) },
+          { id: "markups", icon: "document", label: `Markup list${markupCount ? ` (${markupCount})` : ""}`, checked: leftTab === "markup", onSelect: () => setLeftTab((t) => (t === "markup" ? null : "markup")) },
+          { id: "stamps", icon: "stamp", label: "Stamps", checked: leftTab === "stamp", onSelect: () => setLeftTab((t) => (t === "stamp" ? null : "stamp")) },
+          { id: "rfis", icon: "rfi", label: `RFI register${rfis.length ? ` (${rfis.length})` : ""}`, checked: leftTab === "rfi", onSelect: () => setLeftTab((t) => (t === "rfi" ? null : "rfi")) },
+          ...(rollByCond.size > 0 ? [{ id: "roll", icon: "roll", label: "Roll goods", checked: rollPanelOpen, onSelect: () => setRollPanelOpen((o) => !o) }] : []),
+          ...(layerEntries.length > 0 ? [{ id: "layers", icon: "layers", label: "PDF layers", checked: layersOpen, onSelect: () => setLayersOpen((o) => !o) }] : []),
+          { id: "revisions", icon: "revisions", label: "Revisions", onSelect: () => setShowRevisions(true) },
+          { id: "estimate", label: "Estimate", onSelect: openEstimate },
+          { id: "report", icon: "document", label: "Report", onSelect: () => setShowReport(true) },
+          "divider",
+          { section: "Drawing" },
+          { id: "snap", label: "Snap to plan lines", checked: snapOn, stayOpen: true, onSelect: () => setSnapOn((v) => !v) },
+          { id: "angle", label: "45° / 90° guides", checked: angleOn, stayOpen: true, onSelect: () => setAngleOn((v) => !v) },
+          { id: "zone", icon: "zone", label: "Zone check", active: tool === "zone", onSelect: () => setTool((t) => (t === "zone" ? "select" : "zone")) },
+          { id: "schedule", icon: "rectTool", label: "Import from schedule", active: tool === "schedule", onSelect: () => { setScheduleAnchor(null); setTool((t) => (t === "schedule" ? "select" : "schedule")); } },
+          { id: "units", label: units === "metric" ? "Units: metric (switch to ft)" : "Units: feet (switch to metric)", onSelect: () => setUnits((u) => (u === "metric" ? "imperial" : "metric")) },
+          "divider",
+          { section: "Workspace" },
+          { id: "layout", icon: "sliders", label: "Layout…", onSelect: () => setWorkspaceLayoutOpen(true) },
+          { id: "focus", icon: "focus", label: "Focus mode", shortcut: "F", onSelect: toggleFocusMode },
+          { id: "controls", label: workspaceControlsOpen ? "Hide classic toolbar" : "Classic toolbar", checked: workspaceControlsOpen, onSelect: () => setWorkspaceControlsOpen((v) => !v) },
+          { id: "classic", label: "Classic layout", onSelect: () => workspacePrefs.setEnabled(false) },
+          ...(cloudMode ? [{ id: "closeproj", label: "Close project", onSelect: closeProject }] : []),
+          { id: "premium-plans", label: "Premium plans", highlight: true, onSelect: openPremiumPricing },
+        ];
+        return <PremiumTopBar
+          title={projectName || active}
+          subtitle={pendingN ? `${pendingN} to review · ${kept} kept` : kept ? `${kept} shape${kept === 1 ? "" : "s"} kept` : "Nothing kept yet"}
+          onBack={() => setView("gallery")} onGallery={() => setView("gallery")}
+          sheets={workspaceSheets} current={treeCurrent} onSheet={(key) => openSheets([key], false)} onMenuDepth={onMenuDepth}
+          scaleMenu={<ToolMenu title={scaleTitle} onOpenChange={onScaleMenuDepth} face={<span data-tour="scale" style={{ display: "inline-flex", alignItems: "center", gap: 8 }}><Icon name="scaleRule" size={16} />{scaleFace}</span>} faceStyle={{ fontFamily: "var(--f-body)", fontSize: 13.5, fontWeight: 500, ...scaleFaceStyle }} menuStyle={{ minWidth: 250 }} items={scaleItems} />}
+          action={finishOk && <button type="button" className="cd-btn" style={{ flex: "0 0 auto", marginLeft: 6 }} onClick={finishShape}>Finish ({poly.length})</button>}
+          onList={() => setShowReport(true)} total={estTotal} onEstimate={openEstimate}
+          moreItems={moreItems}
+          onBell={() => setAgentOpen((v) => !v)} pending={pendingN} />;
+      })()}
       {workspaceLayout && !workspaceArrangement.readout && selShape?.measure_role === "surface_area" && <div className="calm-property-editor"><label>Selected wall height <input aria-label="Selected wall height" type="number" min="0" step={heightStep(units)} value={shapeHDraft ?? dimInputStr(selShape.height_ft, units, "height")} onChange={(e) => { setShapeHDraft(e.target.value); setShapeHeight(e.target.value); }} onBlur={() => { if (shapeHDraft != null) setShapeHeight(shapeHDraft); setShapeHDraft(null); }} /></label><span>{heightUnit(units)} → {fa(selShape.computed?.area_sf || 0)}</span><button type="button" onClick={clearShapeHeight}>Use condition height</button></div>}
       {!focusMode && workspaceLayout && workspaceDetailsOpen && aCond && <div className="calm-property-editor"><strong>{aCond.finish_tag}</strong><ConditionAppearanceEditor cond={aCond} onUpdateCond={updateCond} onSetCondParam={setCondParam} onAssignAttr={assignAttr} conditionColumns={conditionColumns} layout="row" units={units} /><button type="button" onClick={() => setWorkspaceDetailsOpen(false)}>Close properties</button></div>}
       {workspaceLayout && <><WorkspaceCommandMenu open={workspaceSearchOpen} onClose={() => setWorkspaceSearchOpen(false)} actions={workspaceActions} onOpenChange={onMenuDepth} /><WorkspaceLayoutDialog open={workspaceLayoutOpen} onClose={() => setWorkspaceLayoutOpen(false)} prefs={workspacePrefs} onOpenChange={onMenuDepth} /></>}
@@ -10606,7 +10726,8 @@ export default function TakeoffCanvas() {
             { id: "workspace-preview", label: workspaceLayout ? "Classic layout" : "Premium layout — compact controls", onSelect: () => workspacePrefs.setEnabled(!workspaceLayout) },
             { id: "guide", label: "How OpenTakeoff works", shortcut: "?", onSelect: () => setGuideOpen(true) },
             { id: "tour", label: "Guided first takeoff", onSelect: startTour },
-            { id: "connect-ai", label: "Connect your AI", onSelect: () => setConnectOpen(true) },
+            { id: "assistant", label: "Assistant — talk to your own AI here", onSelect: openAssistant },
+          { id: "connect-ai", label: "Connect your AI", onSelect: () => setConnectOpen(true) },
             { id: "theme", label: theme === "dark" ? "Light chrome" : "Dark chrome", onSelect: toggleTheme },
             "divider",
             { id: "schedule", icon: "rectTool", label: "Import from schedule", active: tool === "schedule", onSelect: () => { setScheduleAnchor(null); setTool((t) => (t === "schedule" ? "select" : "schedule")); } },
@@ -10696,7 +10817,7 @@ export default function TakeoffCanvas() {
 
       {/* open-sheet tabs — what you opened from the gallery; click to view,
           ⊞ to side-by-side, ✕ to close; the dropdown lists every open sheet */}
-      {!focusMode && openTabs.length > 0 && (
+      {!focusMode && openTabs.length > 0 && !(workspaceLayout && openTabs.length <= 1 && !sheetGroup.length && !splitView) && (
         <div data-sheet-tabs style={{ display: "flex", gap: 5, alignItems: "center", padding: "5px 14px", flexWrap: openTabs.length > MANY_TABS ? "nowrap" : "wrap", borderBottom: "1px solid var(--ink-faint)", background: "var(--paper-bright)", minWidth: 0 }}>
           <span style={{ fontFamily: "var(--f-mono)", fontSize: 9.5, textTransform: "uppercase", letterSpacing: "0.14em", color: "var(--ink-muted)", flexShrink: 0 }}>Sheets</span>
           {openTabs.length > MANY_TABS && (
@@ -10834,7 +10955,72 @@ export default function TakeoffCanvas() {
            its variety flyout on one tile (five markup kinds don't earn five
            faces). Lives in the canvas row so docked panels + canvas reflow
            beside it; survives focus mode — it IS the tool access. */}
-       {view === "canvas" && (
+       {view === "canvas" && dockBottom && (() => {
+         // Premium's dock: the five everyday tools and Cut, then ⋯ for everything else, then history
+         const toggleLeft = (id) => setLeftTab((t) => (t === id ? null : id));
+         const trayGroups = [
+           ["Measure", [
+             ...(oneClickEnabled() ? [{ id: "oneclick", icon: "oneClick", label: "One-click area — click inside a room", short: "One-click", shortcut: "O", active: tool === "oneclick", onSelect: () => setTool("oneclick") }] : []),
+             { id: "surface", icon: "surface", label: "Surface (wall) area", short: "Wall area", shortcut: "S", active: tool === "surface", onSelect: () => setTool("surface") },
+             { id: "deduct-rect", icon: "deductRect", label: "Rectangle cutout", short: "Rect cutout", shortcut: "⇧D", active: tool === "deduct-rect", onSelect: () => setTool("deduct-rect") },
+           ]],
+           ["Check & find", [
+             { id: "zone", icon: "zone", label: "Zone check — trace a region to read every condition's quantities inside it. Nothing is saved.", short: "Zone check", active: tool === "zone", onSelect: () => setTool((t) => (t === "zone" ? "select" : "zone")) },
+             { id: "symbol", icon: "symbol", label: "Symbol sweep — box one example; every match is counted", short: "Symbol sweep", shortcut: "Y", active: tool === "symbol", onSelect: () => setTool("symbol") },
+             { id: "textcopy", icon: "copyText", label: "Copy text — click two corners around a note or schedule", short: "Copy text", active: tool === "textcopy", onSelect: armCopyText },
+           ]],
+           ["Mark up", [
+             ...annotations.items.map((it) => ({ ...it, short: { "annot-sweep": "Mark all", "annot-selection": "Select notes", "annot-cloud": "Cloud" }[it.id] })),
+             ...MARKUP_TOOLS.filter((t) => !["highlighter", "cloud", "callout"].includes(t.id)).map((t) => ({ id: t.id, icon: t.icon, label: t.label, short: { text: "Text", highlight: "Box", dimension: "Dimension", image: "Image" }[t.id], shortcut: t.shortcut, active: tool === t.id, onSelect: () => { setTool(t.id); setMarkupDraft(null); } })),
+             { id: "approve", icon: "approve", label: "Approval stamp — your sign-off that a takeoff was checked. Human-only.", short: "Approve", active: tool === "approve", onSelect: () => setTool((t) => (t === "approve" ? "select" : "approve")) },
+             { id: "markup-list", icon: "document", label: "Markup list — existing clouds, callouts, and notes", short: "Markup list", count: markupCount, active: leftTab === "markup", onSelect: () => toggleLeft("markup") },
+             { id: "stamps", icon: "stamp", label: "Stamps — reusable annotations dropped click-to-place", short: "Stamp library", count: stampLib.stamps.length, active: leftTab === "stamp", onSelect: () => toggleLeft("stamp") },
+             { id: "rfis", icon: "rfi", label: "RFI register — raise, track, and export Requests For Information", short: "Issues", count: rfis.length, active: leftTab === "rfi", onSelect: () => toggleLeft("rfi") },
+           ]],
+           ["Scale", [
+             { id: "calibrate", icon: "calibrate", label: "Calibrate — click two points of a known dimension", short: "Calibrate", active: tool === "calibrate", onSelect: () => setTool("calibrate") },
+           ]],
+           ["Aids", [
+             { id: "snap", icon: "snap", label: "Snap to plan lines and corners (beta)", short: "Snap", active: snapOn, stayOpen: true, onSelect: () => setSnapOn((v) => !v) },
+             { id: "angle", icon: "angle", label: "45° / 90° angle guides — ⇧ locks", short: "45° / 90°", active: angleOn, stayOpen: true, onSelect: () => setAngleOn((v) => !v) },
+           ]],
+         ];
+         const trayArmed = trayGroups.some(([, items]) => items.some((it) => it.active && !["snap", "angle", "markup-list", "stamps", "rfis"].includes(it.id)));
+         const sep = (k) => <span key={k} aria-hidden="true" style={{ width: 1, height: 24, background: "var(--ink-faint)", margin: "0 5px", flexShrink: 0 }} />;
+         return (
+           <div ref={dockWrapRef} data-dock-wrap onPointerDown={(e) => e.stopPropagation()}
+             style={{ position: "absolute", left: 0, right: 0, bottom: 14, marginInline: "auto", width: "max-content", maxWidth: "calc(100% - 28px)", zIndex: 25 }}>
+             {trayOpen && <ToolTray groups={trayGroups} onPicked={() => setTrayOpen(false)} />}
+             {tool === "highlighter" && (
+               <div style={{ position: "absolute", left: 0, bottom: "calc(100% + 10px)", zIndex: Z.popover, background: "var(--paper-bright)", border: "1px solid var(--ink-faint)", boxShadow: "var(--shadow-pop)", padding: "8px 10px", display: "flex", gap: 6 }} title="Ink">
+                 {HL_INKS.map((c) => <button key={c} onClick={() => setHlStyle((st) => ({ ...st, color: c }))} aria-label={`Ink ${c}`} style={{ width: 16, height: 16, padding: 0, background: c, border: hlStyle.color === c ? "2px solid var(--ink)" : "1px solid var(--ink-faint)", cursor: "pointer" }} />)}
+               </div>
+             )}
+             <nav data-tool-rail data-dock-side="bottom" role="toolbar" aria-label="Tools"
+               style={{ display: "flex", flexDirection: "row", alignItems: "center", gap: 3, padding: "6px 8px", border: "1px solid var(--ink-faint)", borderRadius: 12, background: "var(--paper-cream)", boxShadow: "var(--shadow-2)", overflowX: "auto" }}>
+               {railTile("select", "select", "Select — pick a takeoff, drag points; drag open canvas to pan", "V")}
+               {sep("s1")}
+               {railTile("area", "area", "Area", "A")}
+               {railTile("rect", "rectTool", "Rectangle", "R")}
+               {railTile("linear", "linear", "Linear", "L")}
+               {railTile("count", "count", "Count", "C")}
+               {railTile("cut", "scissors", "Cut — polygon cutout (D); click again for a rectangle cutout (⇧D)", "D",
+                 () => setTool((t) => (t === "deduct" ? "deduct-rect" : "deduct")), { armed: tool === "deduct" || tool === "deduct-rect", tint: tool === "deduct" || tool === "deduct-rect" ? "var(--c-danger)" : undefined })}
+               {sep("s2")}
+               <button type="button" onClick={() => setTrayOpen((v) => !v)} aria-expanded={trayOpen} aria-controls="ot-tool-tray" aria-label="More tools"
+                 title="More tools — measure, check & find, mark up, scale and aids"
+                 style={{ position: "relative", width: "var(--ctl-l)", height: "var(--ctl-l)", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: "var(--r-1)", cursor: "pointer",
+                   border: `1px solid ${trayOpen || trayArmed ? "color-mix(in srgb, var(--cobalt) 45%, transparent)" : "transparent"}`, background: trayOpen ? "var(--tint-select)" : "transparent", color: trayOpen || trayArmed ? "var(--cobalt)" : "var(--ink)" }}>
+                 <Icon name="more" size={18} />
+               </button>
+               {sep("s3")}
+               {railTile("dock-undo", "undo", "Undo", "⌘Z", () => (poly.length ? dropLastPoint() : undoShapeCommand()), { armed: false })}
+               {railTile("dock-redo", "redo", "Redo", "⇧⌘Z", () => redoShapeCommand(), { armed: false })}
+             </nav>
+           </div>
+         );
+       })()}
+       {view === "canvas" && !dockBottom && (
        <nav data-tool-rail data-dock-side={workspaceLayout ? workspaceArrangement.tools : undefined} role="toolbar" aria-label="Tools"
          onPointerDown={dockBottom ? (e) => e.stopPropagation() : undefined}
          style={dockBottom
@@ -11334,9 +11520,29 @@ export default function TakeoffCanvas() {
             exactly as it did as canvas state. Collapse/expand keeps the current
             transform — the stage is anchored top-left, so a re-fit would be a
             jarring jump. */}
+        {workspaceLayout && !focusMode && (
+          <ConditionsDock
+            open={condDockOpen && !fullTableOpen} onClose={() => setCondDockOpen(false)}
+            sheetLabel={(() => { const l = tabLabel(treeCurrent || sheetKey); const m = /^\s*([A-Z]{1,3}-?\d{1,4}(?:\.\d{1,3})?[A-Z]?)\b/i.exec(l); return m ? m[1] : l; })()}
+            conditions={conditions} activeCond={activeCond} hiddenConds={hiddenConds} tradeHidden={tradeHidden} palette={palette}
+            viewTrade={viewTrade} allTrades={ALL_TRADES}
+            tradeLabel={viewTrade !== ALL_TRADES ? (suiteById(viewTrade)?.label || "This trade") : (suiteById(conditionTrade(aCond || {}))?.label || "This trade")}
+            onTradeThis={() => pickViewTrade(viewTrade !== ALL_TRADES ? viewTrade : (conditionTrade(aCond || {}) || ALL_TRADES))}
+            onTradeAll={() => pickViewTrade(ALL_TRADES)}
+            rowById={projRowById} units={units} conditionColumns={conditionColumns} rollByCond={rollByCond}
+            matLib={matLib} matLibById={matLibById}
+            onActivate={panelHandlers.onActivate} onAddCondition={panelHandlers.onAddCondition} onDeleteCondition={panelHandlers.onDeleteCondition}
+            onDuplicateCondition={panelHandlers.onDuplicateCondition} onUpdateCond={panelHandlers.onUpdateCond} onSetCondParam={panelHandlers.onSetCondParam} onAssignAttr={panelHandlers.onAssignAttr}
+            onToggleHidden={panelHandlers.onToggleHidden} onTogglePin={panelHandlers.onTogglePin} onApplyAssembly={panelHandlers.onApplyAssembly}
+            onAddMaterial={panelHandlers.onAddMaterial} onUpdateMaterial={panelHandlers.onUpdateMaterial} onRemoveMaterial={panelHandlers.onRemoveMaterial}
+            matFieldOverridden={panelHandlers.matFieldOverridden} onRevertMatField={panelHandlers.onRevertMatField}
+            onAttachLibMaterial={panelHandlers.onAttachLibMaterial} onPromoteMaterial={panelHandlers.onPromoteMaterial}
+            onFollowFamilyRow={panelHandlers.onFollowFamilyRow} onRestoreDroppedRow={panelHandlers.onRestoreDroppedRow}
+          />
+        )}
         <TakeoffsPanel
           dockSide={workspaceLayout ? workspaceArrangement.takeoffs : undefined} layoutLocked={workspaceLayout && workspaceArrangement.locked} dockHandle={workspaceDockHandle("takeoffs", "Takeoffs")}
-          open={takeoffsOpen}
+          open={workspaceLayout ? fullTableOpen : takeoffsOpen}
           width={panelW}
           overlay={isNarrow}
           multiSheet={groupKeys.length > 1}
@@ -11351,6 +11557,7 @@ export default function TakeoffCanvas() {
           templates={templates}
           palette={palette}
           hiddenConds={hiddenConds}
+          tradeHidden={tradeHidden} viewTradeLabel={viewTrade !== ALL_TRADES ? suiteById(viewTrade)?.label : null} onShowAllTrades={() => setViewTrade(ALL_TRADES)}
           rollByCond={rollByCond}
           transitionSources={transitionSources}
           matLib={matLib}
@@ -11542,7 +11749,7 @@ export default function TakeoffCanvas() {
               {sweep.questions.length > 0 && (
                 <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 150, overflowY: "auto" }}>
                   {sweep.questions.map((q, i) => (
-                    <button key={i} type="button" onClick={() => setSweep((s) => ({ ...s, qIndex: i }))}
+                    <button key={i} type="button" title="Show this spot on the sheet" onClick={() => { setSweep((s) => ({ ...s, qIndex: i })); centerOnSweepQuestion(sweep, i); }}
                       style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 8px", fontFamily: "var(--f-body)", fontSize: "var(--fs-s)", textAlign: "left", background: i === sweep.qIndex ? "var(--tint-select)" : "transparent", border: `1px solid ${i === sweep.qIndex ? "var(--c-warning)" : "var(--ink-faint)"}`, color: q.state === "dismissed" ? "var(--text-faint)" : "var(--ink)", textDecoration: q.state === "dismissed" ? "line-through" : "none", cursor: "pointer" }}>
                       <span style={{ fontFamily: "var(--f-mono)", fontWeight: 700, color: q.state === "accepted" ? "var(--c-positive)" : q.state === "dismissed" ? "var(--text-faint)" : DS.symbol.question }}>{q.state === "accepted" ? "✓" : q.state === "dismissed" ? "×" : "?"}</span>
                       <span>{Math.round(q.score * 100)}%{q.label ? ` · ${q.label.label}` : ""}{q.readings > 1 ? ` · read ${q.readings} ways` : ""}</span>
@@ -11571,6 +11778,28 @@ export default function TakeoffCanvas() {
         <span ref={statusCoordRef} aria-hidden="true" style={{ minWidth: 150 }} />
         <span style={{ opacity: 0.25 }} aria-hidden="true">|</span>
         <span>{scaleFace}</span>
+        <span style={{ opacity: 0.25 }} aria-hidden="true">|</span>
+        <label data-trade-picker="" style={{ display: "flex", alignItems: "center", gap: 6 }}
+          title="The trade this canvas shows: other trades' conditions and shapes hide (the Report, estimate and exports keep everything), and new conditions are booked to it. Yours only; saved in this browser.">
+          <span style={{ opacity: 0.75 }}>Trade</span>
+          <select aria-label="Trade view" value={viewTrade} onChange={(e) => pickViewTrade(e.target.value)}
+            style={{ font: "inherit", color: "inherit", background: "transparent", border: "1px solid currentColor", borderRadius: 0, padding: "0 4px", cursor: "pointer" }}>
+            <option value={ALL_TRADES}>All trades ({conditions.length})</option>
+            {TRADE_SUITES.map((t) => <option key={t.id} value={t.id}>{t.label} ({tradeCountMap[t.id] || 0})</option>)}
+          </select>
+        </label>
+        {workspaceLayout && <>
+          <label data-label-picker="" style={{ display: "flex", alignItems: "center", gap: 6 }}
+            title="Phase/area label: new takeoffs get it; with a shape selected (Select tool) it re-labels that shape. Manage the list in the Takeoffs table's Columns tab.">
+            <span style={{ opacity: 0.75 }}>Label</span>
+            <select aria-label="Label" value={tool === "select" && selectedId ? shapeLabelValue(shapes.find((sh) => sh.id === selectedId)) : (activeLabel || "")} onChange={(e) => activateLabel(e.target.value || null)}
+              style={{ font: "inherit", color: "inherit", background: "transparent", border: "1px solid currentColor", borderRadius: 0, padding: "0 4px", cursor: "pointer" }}>
+              <option value="">No label</option>
+              {shapeLabels.map((v) => <option key={v} value={v}>{v}</option>)}
+            </select>
+          </label>
+          <span data-status-draft="" style={{ display: "inline-flex" }}>{draftMenu}</span>
+        </>}
         {commitMsg && (
           <span title={commitMsg} style={{ marginLeft: 8, color: isDangerMsg(commitMsg) ? "var(--c-danger)" : "var(--c-positive)", overflow: "hidden", textOverflow: "ellipsis", minWidth: 0 }}>
             {commitMsg}
@@ -11599,6 +11828,8 @@ export default function TakeoffCanvas() {
       {/* the manual, last in the tree so it sits above every panel and dock */}
       {guideOpen && <UserGuide onClose={() => setGuideOpen(false)} onTour={startTour} onConnect={() => { setGuideOpen(false); setConnectOpen(true); }} />}
       {connectOpen && <ConnectAI onClose={() => setConnectOpen(false)} />}
+      <AssistantWindow open={assistantOpen} onOpen={openAssistant} onClose={() => setAssistantOpen(false)}
+        launcher={view === "canvas" && !showReport && !focusMode && !workspaceLayout} onConnectHelp={() => setConnectOpen(true)} />
       {companySetupOpen && <CompanySetup onClose={() => setCompanySetupOpen(false)} onSaved={() => setCompanyRev((r) => r + 1)} />}
       {tour && view === "canvas" && !focusMode && !guideOpen && !connectOpen && (
         <FirstTakeoffTour done={tour.done} step={currentStep(tour.done)} sheetOpen={tourSheetOpen}
